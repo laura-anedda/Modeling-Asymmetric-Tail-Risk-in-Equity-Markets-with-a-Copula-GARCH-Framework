@@ -1,0 +1,1856 @@
+---
+title: "Modeling Asymmetric Tail Risk in Equity Markets with a Copula–GARCH Framework"
+author: "Laura Anedda"
+format:
+  html:
+    df_print: paged
+    toc: false
+abstract: > 
+  This report investigates the joint dynamics of the S&P 500 (^GSPC) and STOXX Europe 600 (^STOXX) equity indices from 1 January 2010 to the present. A two-stage Copula–GARCH framework is employed: first, marginal conditional heteroskedasticity is modeled using univariate GARCH(1,1) processes; second, the standardized innovations are coupled via a variety of parametric copulas (Gaussian, Student‑t, and Archimedean families). Model selection is guided by information criteria and tail-dependence diagnostics.
+  A Monte Carlo simulation is performed to assess joint tail risk, highlighting how standard VaR metrics may underestimate portfolio risk under the false assumption of independence. The analysis quantifies the probability of simultaneous 95% drawdowns across both indices and reveals a significant tail-dependence penalty.
+  Building on this, the study develops a conditional probability-based trading strategy that exploits short-term pricing dislocations between the two assets. By interpreting asymmetric tail events as signals of relative mispricing, the framework generates systematic long/short positions aimed at capturing mean-reverting behaviour implied by the joint distribution. This end-to-end approach provides insights for both risk management and tactical allocation under extreme co-movement regimes.
+---
+
+# 0. Introduction
+
+Assessing joint tail risk—the probability of extreme losses occurring simultaneously across multiple assets—is a critical challenge in financial risk management. Standard Value at Risk (VaR) methods often assume independence among asset returns, leading to a potential underestimation of portfolio risk, especially under stress conditions when dependencies tend to strengthen. Empirical evidence shows that during market turmoil, asset returns frequently exhibit nonlinear dependencies and joint extreme behavior that cannot be captured by models relying on simple correlation or Gaussian assumptions.
+
+To address these limitations, this study employs a Copula-GARCH framework, which separates the modeling of marginal volatility dynamics from the cross-sectional dependence structure. Univariate GARCH models are employed to capture the heteroskedastic and clustered volatility patterns typical of financial time series. The residuals from these models are transformed using the Probability Integral Transform (PIT) and used to estimate a copula, which allows for the modeling of complex, non-linear, and asymmetric dependence structures, including tail dependence.
+
+The methodological workflow implemented in this study proceeds as follows:
+
+-   **Data Preparation**: Log-returns of two equity indices are computed and preprocessed.
+
+-   **Marginal Modeling**: Each return series is modeled using a GARCH(1,1) process to account for conditional volatility dynamics.
+
+-   **Model Selection:** Diagnostics are conducted to assess the adequacy of the marginal models and select the best specifications.
+
+-   **Copula Estimation:** Standardized residuals are transformed via PIT, and several copula families (Gaussian, Student-t, Archimedean) are fitted. Selection is guided by information criteria (e.g., AIC) and tail dependence diagnostics.
+
+-   **Monte Carlo Simulation:** 10,000 joint scenarios are simulated using the selected copula and inverted back to the original return scale using the GARCH marginals.
+
+-   **Joint Tail Risk Estimation:** The empirical probability of both assets breaching their respective 95% VaR thresholds is computed and compared to the theoretical benchmark under independence (0.0025), illustrating the importance of correctly modeling dependence.
+
+-   **Trading Signal Generation:** Based on the copula-implied conditional probabilities, relative-value trading signals are constructed. Positions are taken only when strong asymmetries in joint tail behaviour are detected, exploiting short-term dislocations between the two assets through systematic long/short allocations.
+
+```{r setup, results = 'hide', message=FALSE, warning=FALSE, echo=FALSE, cache=FALSE}
+# Load and install required packages
+pkgs <- c("quantmod", "rugarch", "copula", "ggplot2", "plotly", "plot3D", "parallel", "xts", "dplyr", "viridisLite", "knitr", "mvtnorm", "patchwork", "grid", "FinTS", "kableExtra", "tidyverse", "VineCopula", "PerformanceAnalytics")
+invisible(lapply(pkgs, function(p) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)))
+lapply(pkgs, library, character.only = TRUE)
+ 
+# Unified table formatter
+.table_counter <- 0
+format_table <- function(
+  df,               # data.frame or matrix
+  caption = NULL,   # text without numbering prefix
+  highlight = NULL, # row number to highlight
+  digits = 4,       # decimal digits
+  align = NULL      # column alignment vector
+) {
+  .table_counter <<- .table_counter + 1
+  numbered_caption <- sprintf("Table %d: %s", .table_counter, caption)
+  
+  if (is.null(align)) align <- c("l", rep("r", ncol(df) - 1))
+  tbl <- knitr::kable(
+    df,
+    caption     = numbered_caption,
+    format      = "html",
+    booktabs    = TRUE,
+    digits      = digits,
+    align       = align,
+    format.args = list(big.mark = ",")
+  ) |>
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover"),
+      full_width        = TRUE,
+      position          = "center",
+      font_size         = 10
+    ) |>
+    kableExtra::row_spec(0, bold = TRUE) |>
+    kableExtra::column_spec(1, bold = TRUE)
+
+  if (!is.null(highlight)) {
+    tbl <- kableExtra::row_spec(tbl, highlight, background = "#C6EFCE")
+  }
+  tbl
+}
+
+```
+
+------------------------------------------------------------------------
+
+## 1. Data Preparation
+
+Let $P_t^{(i)}$ denote the adjusted closing price of asset $i$ on trading day $t$. We retrieve adjusted closing prices, ensuring dividend and split adjustments. This yields two price series, $P_t^{(1)} = P_{SP,t}$ and $P_t^{(2)} = P_{STOXX,t}$, for subsequent return calculation.
+
+```{r data-download, cache=TRUE, warning=FALSE, echo=FALSE, include=FALSE}
+set.seed(123)
+start_date <- "2010-01-01"
+end_date   <- Sys.Date()
+getSymbols(c("^GSPC", "^STOXX"), src = "yahoo",
+           from = start_date, to = end_date, adjust = TRUE)
+sp_price    <- Ad(GSPC)
+stoxx_price <- Ad(STOXX)
+```
+
+Under the **efficient‑markets hypothesis** prices follow a forward‑looking martingale difference sequence, but not necessarily with homoskedastic increments, motivating the volatility model introduced next.
+
+**Returns Calculation**
+
+For each series we construct continuously compounded (log) returns
+
+$$
+r_t^{(i)} = \ln P_t^{(i)} - \ln P_{t-1}^{(i)},
+\qquad i \in \{1,2\}.
+$$
+
+Logarithmic scaling ensures (i) additivity over time, (ii) approximation to simple returns for small price moves, (iii) symmetry of positive and negative innovations in the neighborhood of zero.
+
+The return vector is
+
+$$
+\boldsymbol{r}_t =
+\begin{pmatrix}
+r_t^{(1)}\\[4pt]
+r_t^{(2)}
+\end{pmatrix},
+\qquad t = 2,\ldots,T.
+$$
+
+Missing values introduced by non‑synchronous holidays are removed via *listwise deletion*, yielding a balanced panel of joint observations: $$
+\boldsymbol{r} = \bigl\{\boldsymbol{r}_t\bigr\}_{t=2}^{T}.
+$$
+
+```{r returns, cache=TRUE, warning=FALSE, echo=FALSE}
+sp_ret    <- dailyReturn(sp_price,    type = "log")
+stoxx_ret <- dailyReturn(stoxx_price, type = "log")
+ret_data  <- na.omit(merge(sp_ret, stoxx_ret))
+colnames(ret_data) <- c("SP", "STOXX")
+```
+
+------------------------------------------------------------------------
+
+## 2. Marginal Models for Volatility Dynamics
+
+The first stage of our Copula-GARCH framework involves modeling the marginal volatility dynamics of each return series. We consider three GARCH specifications combined with six different distributions for the innovations.
+
+### 2.1 GARCH Model Specifications
+
+#### Standard GARCH(1,1)
+
+The basic GARCH(1,1) model assumes: $$
+\begin{aligned}
+r_t &= \sigma_t z_t \\
+\sigma_t^2 &= \omega + \alpha r_{t-1}^2 + \beta \sigma_{t-1}^2
+\end{aligned}
+$$ where $\omega > 0$, $\alpha, \beta \geq 0$, and $\alpha + \beta < 1$ for stationarity.
+
+#### GJR-GARCH(1,1)
+
+This model extends standard GARCH by allowing asymmetric response to negative returns: $$
+\begin{aligned}
+r_t &= \sigma_t z_t \\
+\sigma_t^2 &= \omega + \alpha r_{t-1}^2 + \gamma r_{t-1}^2 \mathbf{1}_{r_{t-1} < 0} + \beta \sigma_{t-1}^2
+\end{aligned}
+$$ where $\gamma$ captures the additional impact of negative returns ("leverage effect").
+
+#### EGARCH(1,1)
+
+The Exponential GARCH models log-volatility to ensure positivity: $$
+\begin{aligned}
+r_t &= \sigma_t z_t \\
+\log(\sigma_t^2) &= \omega + \alpha \left|\frac{r_{t-1}}{\sigma_{t-1}}\right| + \gamma \frac{r_{t-1}}{\sigma_{t-1}} + \beta \log(\sigma_{t-1}^2)
+\end{aligned}
+$$ where $\gamma$ captures asymmetric effects without requiring parameter constraints.
+
+### 2.2 Innovation Distributions
+
+For each GARCH specification, we consider six different distributions for the innovations $z_t$. All distributions are automatically standardized by the `rugarch` package to ensure proper scaling of the volatility process, making the conditional variance $\sigma_t^2$ interpretable across different specifications.
+
+> **Technical note**: Standardization involves rescaling each innovation distribution so that its first two moments satisfy $\mathbb{E}[z_t] = 0$ and $\mathrm{Var}(z_t) = 1$. This allows the conditional variance $\sigma_t^2$ to reflect only the time-varying volatility, without being influenced by changes in the innovation scale or shape. This assumption follows the standard GARCH framework, where the innovations are assumed to be i.i.d. with zero mean and unit variance.
+
+```{r distributions, echo=FALSE, results='asis'}
+print(
+  format_table(
+    data.frame(
+      Distribution = c(
+        "Normal",
+        "Student‑t",
+        "GED",
+        "Skew-Normal",
+        "Skew-Student‑t",
+        "Normal Inverse Gaussian (NIG)"
+      ),
+      `Density Notation` = c(
+        "$z_t \\sim \\mathcal{N}(0,1)$",
+        "$z_t \\sim t(\\nu)$",
+        "$z_t \\sim \\text{GED}(\\nu)$",
+        "$z_t \\sim \\text{SN}(\\xi)$",
+        "$z_t \\sim \\text{ST}(\\nu, \\xi)$",
+        "$z_t \\sim \\text{NIG}(\\alpha, \\beta, \\mu, \\delta)$"
+      ),
+      Symmetry = c("Yes", "Yes", "Yes", "No", "No", "No"),
+      `Tail Behavior` = c("Thin", "Heavy", "Flexible", "Thin", "Heavy", "Very Heavy"),
+      Skewness = c("No", "No", "No", "Yes", "Yes", "Yes"),
+      `Key Parameters` = c(
+        "–",
+        "$\\nu$ (df)",
+        "$\\nu$ (shape)",
+        "$\\xi$ (skewness)",
+        "$\\nu$ (thickness), $\\xi$ (skewness)",
+        "location ($\\mu$), scale ($\\delta$), tail heaviness ($\\alpha$), asymmetry ($\\beta$)"
+      ),
+      Notes = c(
+        "Naturally standardized; often inadequate for capturing extreme market movements.",
+        "Tail thickness controlled by degrees of freedom; better suited for extreme returns.",
+        "Includes Normal ($\\nu = 2$) and Laplace ($\\nu = 1$) as special cases.",
+        "Allows for asymmetry with relatively light tails.",
+        "Combines heavy tails with asymmetry; most flexible among t-distributions.",
+        "Captures both skewness and excess kurtosis; highly flexible and well-suited to finance."
+      )
+    ),
+    caption = "Innovation Distributions Considered for GARCH Models",
+    digits  = 4,
+    align   = c("l", "l", "c", "c", "c", "l", "l")
+  )
+)
+```
+
+Model selection is based on:
+
+1\. **Information Criteria**: AIC, BIC, Shibata, and Hannan-Quinn
+
+2\. **Diagnostic Tests**: - Ljung-Box test for remaining serial correlation - ARCH-LM test for remaining heteroskedasticity
+
+The best model for each series will be selected based on the lowest AIC value among specifications that pass the diagnostic tests.
+
+```{r marginal-selection, cache=TRUE, echo=FALSE}
+set.seed(123)
+
+# List of candidate GARCH specifications
+spec_list <- list(
+    # Standard GARCH(1,1) with different distributions
+    sGARCH_norm = ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "norm"
+    ),
+    sGARCH_std = ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "std"
+    ),
+    sGARCH_ged = ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "ged"
+    ),
+    sGARCH_snorm = ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "snorm"
+    ),
+    sGARCH_sstd = ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "sstd"
+    ),
+    sGARCH_nig = ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "nig"
+    ),
+    # GJR-GARCH with different distributions
+    gjrGARCH_norm = ugarchspec(
+        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "norm"
+    ),
+    gjrGARCH_std = ugarchspec(
+        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "std"
+    ),
+    gjrGARCH_ged = ugarchspec(
+        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "ged"
+    ),
+    gjrGARCH_snorm = ugarchspec(
+        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "snorm"
+    ),
+    gjrGARCH_sstd = ugarchspec(
+        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "sstd"
+    ),
+    gjrGARCH_nig = ugarchspec(
+        variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "nig"
+    ),
+    # EGARCH with different distributions
+    eGARCH_norm = ugarchspec(
+        variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "norm"
+    ),
+    eGARCH_std = ugarchspec(
+        variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "std"
+    ),
+    eGARCH_ged = ugarchspec(
+        variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "ged"
+    ),
+    eGARCH_snorm = ugarchspec(
+        variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "snorm"
+    ),
+    eGARCH_sstd = ugarchspec(
+        variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "sstd"
+    ),
+    eGARCH_nig = ugarchspec(
+        variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+        mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+        distribution.model = "nig"
+    )
+)
+
+# Fit models to both series
+fits_sp <- lapply(spec_list, ugarchfit, data = ret_data$SP)
+fits_stoxx <- lapply(spec_list, ugarchfit, data = ret_data$STOXX)
+
+# Information Criteria comparison
+ic_sp <- t(sapply(fits_sp, infocriteria))
+ic_stoxx <- t(sapply(fits_stoxx, infocriteria))
+
+# Ljung-Box test for standardized residuals
+lb_test <- function(fit) {
+    res <- residuals(fit, standardize = TRUE)
+    lb <- Box.test(res, lag = 10, type = "Ljung-Box")
+    return(lb$p.value)
+}
+
+lb_sp <- sapply(fits_sp, lb_test)
+lb_stoxx <- sapply(fits_stoxx, lb_test)
+
+# ARCH LM test for remaining heteroskedasticity
+arch_test <- function(fit) {
+    res <- residuals(fit, standardize = TRUE)
+    arch <- ArchTest(res, lags = 5)
+    return(arch$p.value)
+}
+
+arch_sp <- sapply(fits_sp, arch_test)
+arch_stoxx <- sapply(fits_stoxx, arch_test)
+
+# Diagnostic tests comparison
+diagnostics_sp <- rbind(
+    "Ljung-Box p-value" = lb_sp,
+    "ARCH-LM p-value" = arch_sp
+)
+
+diagnostics_stoxx <- rbind(
+    "Ljung-Box p-value" = lb_stoxx,
+    "ARCH-LM p-value" = arch_stoxx
+)
+
+# Select best models based on AIC
+best_sp <- fits_sp[[which.min(sapply(fits_sp, function(x) infocriteria(x)[1]))]]  
+best_stoxx <- fits_stoxx[[which.min(sapply(fits_stoxx, function(x) infocriteria(x)[1]))]]
+
+# Update the fits for subsequent analysis
+fit_sp <- best_sp
+fit_stoxx <- best_stoxx
+```
+
+```{r display-results, results='asis', message=FALSE, warning=FALSE, echo=FALSE}
+# Readable model names
+model_names <- c(
+  sGARCH_norm   = "sGARCH(1,1) – Normal",        sGARCH_std    = "sGARCH(1,1) – Student-t",
+  sGARCH_ged    = "sGARCH(1,1) – GED",           sGARCH_snorm  = "sGARCH(1,1) – Skew-Normal",
+  sGARCH_sstd   = "sGARCH(1,1) – Skew-Student",  sGARCH_nig    = "sGARCH(1,1) – NIG",
+  gjrGARCH_norm = "GJR-GARCH(1,1) – Normal",     gjrGARCH_std  = "GJR-GARCH(1,1) – Student-t",
+  gjrGARCH_ged  = "GJR-GARCH(1,1) – GED",        gjrGARCH_snorm= "GJR-GARCH(1,1) – Skew-Normal",
+  gjrGARCH_sstd = "GJR-GARCH(1,1) – Skew-Student", gjrGARCH_nig = "GJR-GARCH(1,1) – NIG",
+  eGARCH_norm   = "EGARCH(1,1) – Normal",        eGARCH_std    = "EGARCH(1,1) – Student-t",
+  eGARCH_ged    = "EGARCH(1,1) – GED",           eGARCH_snorm  = "EGARCH(1,1) – Skew-Normal",
+  eGARCH_sstd   = "EGARCH(1,1) – Skew-Student",  eGARCH_nig    = "EGARCH(1,1) – NIG"
+)
+
+# Information Criteria table
+format_ic_table <- function(ic_tbl, index) {
+  df <- as.data.frame(ic_tbl)
+  names(df) <- c("AIC", "BIC", "Shibata", "Hannan–Quinn")
+  df <- data.frame(
+    Model = model_names[rownames(df)],
+    df,
+    row.names = NULL,
+    check.names = FALSE
+  )
+  best <- which.min(df$AIC)
+  format_table(
+    df,
+    caption   = paste(index, "GARCH models – Information Criteria"),
+    highlight = best
+  )
+}
+
+# Residual Diagnostics table
+format_diag_table <- function(diag_tbl, index) {
+  diag_mat <- as.data.frame(t(diag_tbl))
+  colnames(diag_mat) <- c("Ljung-Box (p-value)", "ARCH-LM (p-value)")
+  df <- data.frame(
+    Model = model_names[rownames(diag_mat)],
+    diag_mat,
+    check.names = FALSE
+  )
+  # Drop original row names so only 'Model' column appears
+  rownames(df) <- NULL
+  format_table(
+    df,
+    caption = paste(index, "GARCH models – Residual Diagnostics")
+  )
+}
+
+# Display results for each index
+display_results <- function(index, ic_tbl, diag_tbl) {
+  cat(sprintf("\n\n### %s – Model Comparison\n", index))
+  print(format_ic_table(ic_tbl, index))
+  cat(sprintf("\n\n### %s – Diagnostic Tests\n", index))
+  print(format_diag_table(diag_tbl, index))
+}
+
+# Show tables
+## 1. Information Criteria & Diagnostics
+display_results("S&P 500",  ic_sp,     diagnostics_sp)
+display_results("STOXX 600", ic_stoxx,  diagnostics_stoxx)
+
+## 2. Best model by AIC
+best_models <- data.frame(
+  Index = c("S&P 500", "STOXX 600"),
+  Model = c(
+    model_names[names(fits_sp)[which.min(sapply(fits_sp, function(m) infocriteria(m)[1]))]],
+    model_names[names(fits_stoxx)[which.min(sapply(fits_stoxx, function(m) infocriteria(m)[1]))]]
+  ),
+  AIC   = c(infocriteria(best_sp)[1], infocriteria(best_stoxx)[1])
+)
+```
+
+### 2.3 Results of Model Selection
+
+The comparative analysis of 18 GARCH‐type specifications—spanning standard GARCH, GJR‐GARCH and EGARCH models under six alternative innovation distributions—yields the following key insights for both the S&P 500 and STOXX 600 indices.
+
+1.  **Distribution Effects**: Non-Gaussian innovations consistently outperform the Normal distribution in terms of information criteria. The Normal Inverse Gaussian (NIG) distribution achieves the lowest AIC values across nearly all model classes, followed by the Skew-Student-t, highlighting the importance of modeling fat tails and asymmetry.
+
+2.  **Role of Asymmetric Volatility Structures**: Models incorporating leverage effects, such as GJR-GARCH and especially EGARCH(1,1), significantly improve fit. EGARCH consistently produces the lowest AICs, reflecting strong asymmetries in how negative returns impact volatility.
+
+3.  **Diagnostic Tests**: All candidate models satisfy the Ljung–Box test for standardized residual autocorrelation (all p-values \> 0.05), confirming that no significant serial dependence remains. Likewise, the ARCH-LM test p-values exceed 0.05 in every case, indicating that conditional heteroskedasticity has been effectively captured. Hence, the winning specifications are not only parsimonious in terms of information criteria but also pass rigorous mis­specification checks.
+
+4.  **Best Model Selection**:
+
+    Selecting among those specifications that clear both diagnostic hurdles, the EGARCH(1,1) model with NIG‐distributed innovations emerges as the unequivocal optimum for both indices:
+
+    ```{r best-models, echo=FALSE, results='asis'}
+    print(
+      format_table(
+        best_models,
+        caption = "Lowest-AIC Model per Index",
+        align   = c("l", "l", "r"),
+        digits  = 4
+      )
+    )
+    ```
+
+    The congruence of both markets’ best‐performing models points to a common volatility architecture characterized by asymmetric responses to shocks, fat‐tailed residuals and moderate skewness.
+
+------------------------------------------------------------------------
+
+## 3. Probability‑Integral Transform (PIT)
+
+Under the null that $z_t^{(i)} \overset{i.i.d.}{\sim} F_{Z^{(i)}}$, the probability‑integral transform
+
+$$
+u_t^{(i)} = F_{Z^{(i)}}\!\bigl(z_t^{(i)}\bigr),
+\qquad
+F_{Z^{(i)}}(\cdot) = \text{c.d.f. of the standardized innovations},
+$$
+
+maps the residuals onto the unit interval $[0,1]$ with $u_t^{(i)} \overset{i.i.d.}{\sim} \mathcal{U}(0,1)$.
+
+Numerical clipping $\bigl(u_t^{(i)} \in [\varepsilon,1-\varepsilon]\bigr)$ with $\varepsilon = 10^{-10}$ prevents undefined values in subsequent *log‑likelihood* calculations for extreme observations.
+
+The pair\
+$$
+(U_t, V_t) = \bigl(u_t^{(1)}, u_t^{(2)}\bigr)
+$$\
+constitutes a sample from the *empirical copula* of the two series, free of marginal heteroskedasticity.
+
+```{r pit, warning=FALSE,fig.width = 12, fig.height = 5, cache=TRUE, echo=FALSE}
+z_sp    <- residuals(fit_sp, standardize = TRUE)
+z_stoxx <- residuals(fit_stoxx, standardize = TRUE)
+
+u <- pnorm(z_sp)
+v <- pnorm(z_stoxx)
+eps <- 1e-10
+u <- pmax(pmin(u, 1 - eps), eps)
+v <- pmax(pmin(v, 1 - eps), eps)
+uv <- as.matrix(cbind(u, v))
+
+df_uv <- data.frame(u = u, v = v)
+
+# Helper function to create QQ-plots
+make_qq_plot <- function(var, label) {
+  ggplot(df_uv, aes(sample = .data[[var]])) +
+    geom_qq(aes(color = "PIT Quantiles"), distribution = qunif, size = 1) +
+    geom_qq_line(aes(color = "Uniform(0,1) Line"), distribution = qunif, linewidth = 0.6) +
+    scale_color_manual(
+      name = "Legend",
+      values = c("PIT Quantiles" = "#00008B", "Uniform(0,1) Line" = "#9e0142")
+    ) +
+    labs(
+      title = paste(label, ": PITs vs Uniform(0,1)"),
+      x = "Theoretical Quantiles",
+      y = "Empirical Quantiles"
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+# Generate plots
+qq_u <- make_qq_plot("u", "S&P 500")
+qq_v <- make_qq_plot("v", "STOXX 600")
+
+# Combine with shared legend and title
+qq_u + qq_v +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    title = "QQ-Plots of Probability Integral Transforms (PITs)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+  )
+```
+
+------------------------------------------------------------------------
+
+## 4. Copula Estimation
+
+Let $F_{R_1, R_2}(r_1, r_2)$ denote the joint cumulative distribution function (c.d.f.) of the raw returns, and $F_{R_i}(r_i)$ their respective marginals.
+
+By Sklar’s theorem, there exists a unique copula function $C : [0,1]^2 \to [0,1]$ such that
+
+$$
+F_{R_1, R_2}(r_1, r_2)
+= C\bigl(F_{R_1}(r_1), F_{R_2}(r_2)\bigr).
+$$
+
+After applying marginal filtering using GARCH models, we focus instead on the copula of the probability integral transforms (PITs) of the residuals:
+
+$$
+C_{Z_1, Z_2}(u, v)
+= \mathbb{P}\bigl(U_t \le u, V_t \le v\bigr),
+\quad (u,v) \in [0,1]^2,
+$$
+
+where $C_{Z_1, Z_2}$ captures the pure cross-sectional dependence structure, disentangled from any serial autocorrelation effects.
+
+Parametric choices for $C$ include:
+
+-   **Gaussian copula**: symmetric, no tail dependence.
+-   **Student’s t-copula**: symmetric tail dependence via degrees of freedom $\nu$.
+-   **Archimedean copulas** (Frank, Clayton, Gumbel, Joe): one‑parameter, asymmetric tail behaviour that is empirically relevant for equity markets exhibiting *co‑crashes*..
+
+Estimation proceeds via full maximum likelihood (ML).
+
+```{r copula-fit, cache=TRUE, results='asis', echo=FALSE}
+# Gaussian copula
+set.seed(123)
+fit_gauss <- fitCopula(normalCopula(dim = 2), uv, method = "ml")
+
+# t-copula with degrees of freedom
+start_t   <- c(rho = coef(fit_gauss), df = 6)
+fit_t     <- fitCopula(tCopula(dim = 2, dispstr = "un", df = NA), uv,
+                       method = "ml", start = start_t,
+                       lower  = c(-0.99,  2.01),
+                       upper  = c( 0.99,200),
+                       optim.method = "L-BFGS-B"
+                       )
+
+# Archimedean copulas: Frank, Clayton, Gumbel, Joe
+fits_arch <- lapply(
+  list(
+    frank   = frankCopula(dim = 2),
+    clayton = claytonCopula(dim = 2),
+    gumbel  = gumbelCopula(dim = 2),
+    joe     = joeCopula(dim = 2)
+  ), fitCopula, data = uv, method = "ml"
+)
+
+# — Elliptical copulas (Gaussian & Student‑t) —
+elliptical_params <- data.frame(
+  Model = c("Gaussian", "Student-t"),
+  ρ   = c(unname(coef(fit_gauss)), unname(coef(fit_t)["rho.1"])),
+  df  = c(NA,                        unname(coef(fit_t)["df"])),
+  row.names = NULL
+)
+print(
+  format_table(
+    elliptical_params,
+    caption = "MLE parameter estimates for Elliptical copulas",
+    digits  = 3
+  )
+)
+
+# — Archimedean copulas (Frank, Clayton, Gumbel, Joe) —
+arch_params <- data.frame(
+  Model = c("Frank", "Clayton", "Gumbel", "Joe"),
+  θ  = unname(sapply(fits_arch, coef)),
+  row.names = NULL
+)
+print(
+  format_table(
+    arch_params,
+    caption = "MLE parameter estimates for Archimedean copulas",
+    digits  = 3
+  )
+)
+```
+
+```{r 3D_surface, cache=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.height=8, fig.width=10}
+# 3D surface of Gaussian copula density
+
+# Common grid
+grid <- expand.grid(
+  u = seq(0.01, 0.99, length = 50),
+  v = seq(0.01, 0.99, length = 50)
+)
+
+grid_matrix <- as.matrix(grid)
+u_seq <- seq(0.01, 0.99, length = 50)
+
+# Compute copula densities
+z_gauss   <- matrix(dCopula(grid_matrix, fit_gauss@copula),   nrow = 50, byrow = FALSE)
+z_t       <- matrix(dCopula(grid_matrix, fit_t@copula),       nrow = 50, byrow = FALSE)
+z_frank   <- matrix(dCopula(grid_matrix, fits_arch$frank@copula),   nrow = 50, byrow = FALSE)
+z_clayton <- matrix(dCopula(grid_matrix, fits_arch$clayton@copula), nrow = 50, byrow = FALSE)
+z_gumbel  <- matrix(dCopula(grid_matrix, fits_arch$gumbel@copula),  nrow = 50, byrow = FALSE)
+z_joe     <- matrix(dCopula(grid_matrix, fits_arch$joe@copula),  nrow = 50, byrow = FALSE)
+
+# Create surface plots for each copula
+make_colorscale <- function(palette) {
+  lapply(seq_along(palette), function(i) {
+    list((i - 1) / (length(palette) - 1), palette[i])
+  })
+}
+scale_rocket <- make_colorscale(rocket(10))
+fig_gauss   <- plot_ly(x = u_seq, y = u_seq, z = z_gauss,   type = "surface", visible = TRUE,  colorscale = scale_rocket)
+fig_t       <- plot_ly(x = u_seq, y = u_seq, z = z_t,       type = "surface", visible = FALSE, colorscale = scale_rocket)
+fig_frank   <- plot_ly(x = u_seq, y = u_seq, z = z_frank,   type = "surface", visible = FALSE, colorscale = scale_rocket)
+fig_clayton <- plot_ly(x = u_seq, y = u_seq, z = z_clayton, type = "surface", visible = FALSE, colorscale = scale_rocket)
+fig_gumbel  <- plot_ly(x = u_seq, y = u_seq, z = z_gumbel,  type = "surface", visible = FALSE, colorscale = scale_rocket)
+fig_joe     <- plot_ly(x = u_seq, y = u_seq, z = z_joe,     type = "surface", visible = FALSE, colorscale = scale_rocket)
+
+# Combine all figures with interactive dropdown menu
+fig <- subplot(fig_gauss, fig_t, fig_frank, fig_clayton, fig_gumbel, fig_joe, nrows = 1) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "u"),
+      yaxis = list(title = "v"),
+      zaxis = list(title = "Density")
+    ),
+    updatemenus = list(
+      list(
+        buttons = list(
+          list(method = "update",
+               args = list(list(visible = c(TRUE, FALSE, FALSE, FALSE, FALSE, FALSE)),
+                           list(annotations = list(list(text = "3D Density: Gaussian Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))))),
+               label = "Gaussian"),
+          list(method = "update",
+               args = list(list(visible = c(FALSE, TRUE, FALSE, FALSE, FALSE, FALSE)),
+                           list(annotations = list(list(text = "3D Density: Student-t Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))))),
+               label = "Student-t"),
+          list(method = "update",
+               args = list(list(visible = c(FALSE, FALSE, TRUE, FALSE, FALSE, FALSE)),
+                           list(annotations = list(list(text = "3D Density: Frank Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))))),
+               label = "Frank"),
+          list(method = "update",
+               args = list(list(visible = c(FALSE, FALSE, FALSE, TRUE, FALSE, FALSE)),
+                           list(annotations = list(list(text = "3D Density: Clayton Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))))),
+               label = "Clayton"),
+          list(method = "update",
+               args = list(list(visible = c(FALSE, FALSE, FALSE, FALSE, TRUE, FALSE)),
+                           list(annotations = list(list(text = "3D Density: Gumbel Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))))),
+               label = "Gumbel"),
+          list(method = "update",
+               args = list(list(visible = c(FALSE, FALSE, FALSE, FALSE, FALSE, TRUE)),
+                           list(annotations = list(list(text = "3D Density: Joe Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))))),
+               label = "Joe")
+        ),
+        direction = "down",
+        x = 0.1,
+        y = 1.15
+      )
+    ),
+    annotations = list(
+      list(text = "3D Density: Gaussian Copula", x = 0.5, y = 1.1, showarrow = FALSE, xref = "paper", yref = "paper", font = list(size = 16))
+    )
+  )
+
+fig
+```
+
+------------------------------------------------------------------------
+
+## 5. Diagnostic Measures
+
+This section evaluates the adequacy of various copula specifications using a three-step diagnostic framework:
+
+(1) Information-theoretic comparison via the Akaike Information Criterion (AIC),
+
+(2) Monte Carlo consistency of rank-based concordance measures (Kendall’s $\tau$, Spearman’s $\rho_S$),
+
+(3) Comparison of model-implied tail dependence with semi-parametric estimates.
+
+Together, these diagnostics ensure that selected models fit the joint distribution not only in the center but also in the tails, which is particularly important for financial risk applications.
+
+The empirical copula sample $\mathcal{S} = \bigl\{(U_t,V_t)\bigr\}_{t=1}^{T}$ provides a non‑parametric benchmark against which each\
+parametric copula $C_{\!\theta}(u,v)$ is evaluated.
+
+------------------------------------------------------------------------
+
+### 5.1 AIC-Based Model Ranking {.unnumbered}
+
+Model adequacy is gauged by the **Akaike Information Criterion** (**AIC**; Akaike 1974):
+
+$$
+\operatorname{AIC}
+  = 2k - 2\ell_{\max},
+\tag{6.1}
+$$
+
+where $k$ is the number of free parameters and $\ell_{\max}$ the maximised log‑likelihood of the copula–GARCH model. Lower AIC signals better *Kullback–Leibler* proximity to the unknown data‑generating copula.
+
+```{r aic, cache=FALSE, warning=FALSE, results='asis', echo=FALSE}
+## --- 1) AIC COMPARISON ----------------------------------------
+set.seed(123)
+aic_tbl <- data.frame(
+  Model = c("Gaussian", "Student‑t", names(fits_arch)),
+  AIC   = c(
+    AIC(fit_gauss),
+    AIC(fit_t),
+    sapply(fits_arch, AIC)
+  )
+)
+print(
+  format_table(
+    aic_tbl,
+    caption = "AIC Comparison for Copula Models",
+    digits  = 3
+  )
+)
+```
+
+AIC comparison reveals that the **Student‑t** copula achieves the lowest AIC (`r round(aic_tbl$AIC[aic_tbl$Model=="Student‑t"], 3)`), indicating the best trade-off between model fit and complexity. It substantially outperforms all other candidates, including the **Gaussian** (`r round(aic_tbl$AIC[aic_tbl$Model=="Gaussian"], 3)`) and **Gumbel** (`r round(aic_tbl$AIC[aic_tbl$Model=="gumbel"], 3)`) models. The **Frank** (`r round(aic_tbl$AIC[aic_tbl$Model=="frank"], 3)`) and **Joe** (`r round(aic_tbl$AIC[aic_tbl$Model=="joe"], 3)`) copulas perform significantly worse, with the **Clayton** model showing the poorest fit by a wide margin (`r round(aic_tbl$AIC[aic_tbl$Model=="clayton"], 3)`).
+
+Since AIC penalizes model complexity while rewarding goodness of fit, the **Student‑t copula emerges as the most suitable choice** under information-theoretic criteria, capturing the joint distribution more effectively than both elliptical and Archimedean alternatives.
+
+### 5.2 Monte Carlo Confidence Checks for Concordance
+
+Global (rank‑based) dependence is reported via
+
+$$
+\begin{aligned}
+\tau &= 4\!\iint_{[0,1]^2} C(u,v)\,dC(u,v) - 1, \\[6pt]
+\rho_S &= 12\!\iint_{[0,1]^2} uv\,dC(u,v) - 3,
+\end{aligned}
+\tag{6.2}
+$$
+
+i.e. **Kendall’s** $\tau$ and **Spearman’s** $\rho_S$, respectively.
+
+For elliptical copulas $C_{\!\theta}$ both statistics are *monotonic functions* of the dependence parameter $\theta$, allowing closed‑form inversion (e.g.,$\theta = 2 \sin\!\bigl(\tfrac{\pi}{6}\tau\bigr)$ for the Gaussian case).\
+By contrasting the *parametric* $\tau, \rho_S$ implied by the fitted copula with their *empirical* counterparts $\hat{\tau},\hat{\rho}_S$, we can assess the presence of global mis-specification in the dependence structure.
+
+To assess whether the fitted copulas correctly replicate global dependence, we compare the parametric Kendall’s τ and Spearman’s ρₛ to their empirical counterparts using Monte Carlo standard errors:$\lvert\tau{\rm model}-\hat\tau\rvert < 2,\mathrm{SE}(\hat\tau)$ and $\lvert\rho{S,\rm model}-\hat\rho_S\rvert < 2,\mathrm{SE}(\hat\rho_S)$. If the empirical values of Kendall’s $\tau$ and Spearman’s $\rho$ fall within the Monte Carlo confidence interval implied by a given copula, the model is considered consistent with the observed dependence.
+
+```{r mc, cache=TRUE, echo=FALSE, results='asis'}
+## --- 2) MONTE CARLO CONSISTENCY FOR τ and ρₛ -----------------
+# Empirical concordances
+kendall_emp  <- cor(u, v, method = "kendall")
+spearman_emp <- cor(u, v, method = "spearman")
+
+# Bootstrap SEs
+B <- 499
+set.seed(123)
+boot_tau <- replicate(B, cor(sample(u, replace = TRUE), sample(v, replace = TRUE), method = "kendall"))
+boot_rho <- replicate(B, cor(sample(u, replace = TRUE), sample(v, replace = TRUE), method = "spearman"))
+se_tau <- sd(boot_tau)
+se_rho <- sd(boot_rho)
+
+# Model‐implied tau
+tau_model <- c(
+  Gaussian = tau(fit_gauss@copula),
+  t        = tau(fit_t@copula),
+  frank    = tau(fits_arch$frank@copula),
+  clayton  = tau(fits_arch$clayton@copula),
+  gumbel   = tau(fits_arch$gumbel@copula),
+  joe      = tau(fits_arch$joe@copula)
+)
+
+# Approximate model‐implied Spearman’s rho via sin(π·τ/2)
+rho_model <- sin(as.vector(tau_model) * pi / 2)  # reasonable for elliptical + many Archimedeans
+
+# Check within ±2 SE
+within_tau <- abs(as.numeric(tau_model)   - as.numeric(kendall_emp))  < 2*se_tau
+within_rho <- abs(as.numeric(rho_model)   - as.numeric(spearman_emp)) < 2*se_rho
+
+n_models <- length(tau_model)
+
+mc_tbl <- data.frame(
+  τ_model     = round(tau_model,   3),
+  τ_Empirical = round(rep(kendall_emp, n_models), 3),
+  Within_2SE_τ  = within_tau,
+  ρ_model     = round(rho_model,   3),
+  ρ_Empirical = round(rep(spearman_emp, n_models), 3),
+  Within_2SE_ρ  = within_rho
+)
+print(
+  format_table(
+    mc_tbl,
+    caption = "Monte Carlo Consistency for Kendall’s τ and Spearman’s ρₛ",
+    digits  = 3
+  )
+)
+```
+
+The Monte Carlo consistency check confirms that most models replicate the empirical Kendall’s τ and Spearman’s ρₛ within two standard errors, suggesting good agreement with rank-based dependence. In particular, the **Gaussian**, **Student-t**, **Clayton**, and **Joe** copulas all satisfy the ±2 SE acceptance criterion for both measures. Notably, the Student-t copula—already identified as the best-fitting model by AIC—yields τ ≈ `r round(tau_model["t"], 3)` versus empirical τ = `r round(kendall_emp, 3)`, and ρₛ ≈ `r round(rho_model[2], 3)` versus empirical ρₛ = `r round(spearman_emp, 3)`, confirming its accuracy and flexibility in capturing overall concordance.
+
+In contrast, the **Frank** copula consistently overstates both $\tau$ and $\rho_S$, failing to meet the 2SE threshold and thus revealing a significant misspecification in its dependence structure. Similarly, the **Gumbel** copula—although accurate in estimating Kendall’s $\tau$—overestimates $\rho_S$, indicating an upward bias in the strength of positive dependence. These deviations point to a lack of robustness in capturing the empirical joint behavior.
+
+Despite the Student‑t model performing well overall, its implied ρₛ slightly overestimates the empirical value—indicating that while it offers the best balance, it is not a perfect match.
+
+------------------------------------------------------------------------
+
+### 5.3 Tail Dependence Coefficients {.unnumbered}
+
+Extreme co‑movements between variables are captured by the *lower* and *upper* tail dependence coefficients:
+
+$$
+\lambda_L = \lim_{q \downarrow 0}
+      \Pr\!\bigl(U \le q \,\bigm|\; V \le q\bigr)
+  = \lim_{q \downarrow 0}
+      \frac{C(q,q)}{q},\qquad
+\lambda_U = \lim_{q \uparrow 1}
+      \Pr\!\bigl(U > q \,\bigm|\; V > q\bigr)
+  = \lim_{q \uparrow 1}
+      \frac{1 - 2q + C(q,q)}{1 - q}.
+$$
+
+**Interpretation:**
+
+-   $\lambda_L = 0$ implies *tail independence* in crashes, meaning that extreme losses in one asset are unlikely to be accompanied by losses in the other.
+-   Conversely, $\lambda_L > 0$ indicates a positive probability of joint extreme losses, even after filtering for volatility clustering via GARCH.
+
+The **Gaussian copula** exhibits no tail dependence, regardless of the correlation parameter $\rho \in (-1,1)$:
+
+$$
+\lambda_L = \lambda_U = 0.
+$$
+
+Thus, it cannot capture extreme joint movements—making it unsuitable when modeling joint crashes or booms.
+
+In contrast, the **Student-**$t$ **copula** does exhibit symmetric tail dependence, governed by both the correlation $\rho$ and the degrees of freedom $\nu$. Both lower and upper tail dependence coefficients are symmetric and given by:
+
+$$
+\lambda_L = \lambda_U =
+2,t_{\nu+1}\left(-\sqrt{\frac{(\nu+1)(1-\rho)}{1+\rho}}\right),
+$$
+
+where $t_{\nu}$ is the univariate $t$ c.d.f. Lower $\nu$ values (i.e., heavier tails) result in stronger tail dependence.
+
+The **Clayton copula** captures lower tail dependence only, with:
+
+$$
+\lambda_L = 2^{-1/\theta},\qquad
+\lambda_U = 0, \quad \theta > 0.
+$$
+
+It’s suitable for modeling joint crashes, but not joint booms.
+
+The **Gumbel copula** is the opposite: it captures upper tail dependence only:
+
+$$
+\lambda_U = 2 - 2^{1/\theta},\qquad
+\lambda_L = 0, \quad \theta \ge 1.
+$$
+
+Useful in contexts where joint extreme gains or rallies matter more.
+
+The **Frank copula** is tail independent on both sides:
+
+$$
+\lambda_L = \lambda_U = 0.
+$$
+
+It models moderate symmetric dependence, but lacks the ability to capture extreme co-movement.
+
+Next, we examine the ability of each copula to replicate the empirical co-movement of extreme events. We compare model-implied lower and upper tail dependence with non-parametric estimates using the Kaplan–Meier tail quotient estimator.
+
+```{r km_tail, cache=TRUE, warning=FALSE, results='asis', echo=FALSE}
+## --- 3) TAIL DEPENDENCE VS KM ESTIMATES ----------------------
+set.seed(123)
+# Parametric λ_L, λ_U
+lam_gauss <- lambda(fit_gauss@copula)
+lam_t     <- lambda(fit_t@copula)
+lam_arch  <- sapply(fits_arch, function(x) lambda(x@copula))
+
+# Kaplan–Meier tail‐quotient estimates
+KM_tail <- function(x, y, q = 0.05){
+  n     <- length(x)
+  idx   <- (x < q & y < q)
+  p_hat <- mean(idx)
+  se    <- sqrt(p_hat * (1 - p_hat) / n)
+  c(est = p_hat, se = se)
+}
+km_L <- KM_tail(u, v, q = 0.05)            # lower tail
+km_U <- KM_tail(1 - u, 1 - v, q = 0.05)    # upper tail
+
+tail_tbl <- data.frame(
+  Model       = c("Gaussian", "Student‑t", names(fits_arch)),
+  Lambda_L    = c(lam_gauss[1], lam_t[1],    lam_arch[1, ]),
+  Lambda_U    = c(lam_gauss[2], lam_t[2],    lam_arch[2, ]),
+  KM_Lower    = as.numeric(km_L["est"]),
+  KM_Lower_SE = as.numeric(km_L["se"]),
+  KM_Upper    = as.numeric(km_U["est"]),
+  KM_Upper_SE = as.numeric(km_U["se"])
+)
+print(
+  format_table(
+    tail_tbl,
+    caption = "Parametric vs KM Tail-Dependence Estimates",
+    digits  = 3
+  )
+  ) 
+```
+
+The Kaplan–Meier (KM) estimator places the joint lower-tail probability at approximately `r round(km_L["est"], 3)` (SE ≈ `r round(km_L["se"], 3)`) and the upper-tail probability at about `r round(km_U["est"], 3)` (SE ≈ `r round(km_U["se"], 3)`). These modest yet statistically significant estimates suggest mild but non-negligible tail dependence in both directions. When compared to the parametric values implied by the fitted copulas, none of the models reproduces both tails simultaneously:
+
+-   **Gaussian & Frank**: By construction, both yield $\lambda_L = \lambda_U = 0$, thus fail to capture the empirical evidence of joint tail events. While often adequate for modeling central dependence, they are tail-independent copulas and are unsuitable when extreme co-movements are relevant.
+
+-   **Student‑t**: Produces symmetric tail dependence with $\lambda_L = \lambda_U ≈$ `r round(lam_t[1],3)`, slightly overestimates both tails but correctly reflects the presence of symmetric tail dependence. Among all models, it provides the closest approximation to the empirical KM values, making it the most reliable option for capturing joint crashes and rallies in financial markets.
+
+-   **Clayton**: Exhibits strong lower-tail dependence $λₗ=$ `r round(lam_arch[1, "clayton"],3)`, which matches the notion of strong lower‐tail clustering but vastly overshoots the empirical `r round(km_L["est"], 3)`. Additionally, $λᵤ=0$ fails to capture any upper‐tail co‐movements.
+
+-   **Gumbel**: $λᵤ≈$ `r round(lam_arch[2, "gumbel"], 3)` reflects its focus on upper‐tail dependence—again a severe overestimate of the observed `r round(km_U["est"], 3)` —while $λₗ=0$ misses lower‐tail joint crashes.
+
+-   **Joe**: Similar to Gumbel, overstates upper‐tail clustering $λᵤ≈$ `r round(lam_arch[2, "joe"], 3)`and ignores lower‐tail dependence.
+
+In sum, no one-parameter copula achieves a perfect match with empirical tail behavior. The Student‑t copula, despite modest overestimation, offers the most balanced and consistent fit across both tails. In contrast, Clayton and Gumbel represent stress-test extremes—emphasizing respectively downside and upside joint events—and may be more appropriate for scenario analysis rather than unconditional modeling of dependence.
+
+------------------------------------------------------------------------
+
+### 5.4 Summary {.unnumbered}
+
+-   **AIC** $\;\rightarrow\;$ Student‑$t$ copula.\
+-   **Concordance accuracy** (Kendall’s $\tau$ and Spearman’s $\rho_S$)$\;\rightarrow\;$ Gaussian, Student‑$t$, Clayton, Joe.\
+-   **Tail dependency** $\;\rightarrow\;$ Student‑$t$ (balanced), Clayton (lower), Gumbel (upper).
+
+Combined diagnostic evidence points to the Student‑t copula as the most robust and versatile specification. It achieves the optimal balance between global dependence accuracy: $(AIC, τ̂, ρ̂_S)$ with moderate tail sensitivity. Its symmetric tail structure makes it particularly appropriate in financial contexts where both joint crashes and rallies matter.
+
+For robustness checks focused on downside co‑movement, the **Clayton** copula remains a valuable stress‑testing tool, despite its tendency to overstate lower tail dependence, while **Gumbel** is suitable when modeling joint extreme gains (upper tail dependence).
+
+## 6. Pseudo–Maximum Likelihood Fitting
+
+To relax the assumption of known marginal distributions, we replace the exact PITs $(u_t,v_t)$ with rank‑based uniforms:
+
+$$
+\bigl(\tilde u_t,\tilde v_t\bigr)
+  = \Bigl(\tfrac{1}{n+1}\,\text{rank}(u_t),\;
+          \tfrac{1}{n+1}\,\text{rank}(v_t)\Bigr),
+  \qquad t = 1,\dots,n,
+$$
+
+effectively treating the marginals as **unknown nuisance functions**. This yields a *semiparametric* likelihood
+
+$$
+\tilde{\ell}(\theta)
+  = \sum_{t=1}^{n} \log
+      c_{\theta}\!\bigl(\tilde u_t,\tilde v_t\bigr),
+$$
+
+where $c_{\theta}=\partial_{uv}C_{\theta}$ is the copula density.\
+Maximising $\tilde\ell$ under the constraint that $\theta$ lies in the interior of the parameter space produces the **pseudo‑MLE** $\hat{\theta}_{\text{PMLE}}$.
+
+Building on this formulation, the PMLE inherits two key advantages:
+
+-   **Robustness.** Because no distributional assumptions are imposed on the filtered margins, PMLE is **consistent** even if the GARCH model is mildly misspecified. The estimator is $\sqrt{n}$‑asymptotically normal with sandwich covariance\
+    $\Sigma = A^{-1}BA^{-1}$, where $A = -\partial_{\theta\theta}\tilde{\ell}$ and $B = \text{Var}\!\bigl[\partial_{\theta}\log c_{\theta}\bigr]$.
+-   **Efficiency loss.** Although the semi-parametric approach sacrifices some asymptotic efficiency relative to full MLE, this penalty vanishes as the marginal models become correctly specified—making PMLE a practical compromise between flexibility and statistical precision.
+
+```{r pseudo-fit, cache=TRUE, echo=FALSE}
+n <- nrow(uv)
+pseudo_uv <- as.matrix(pobs(uv))  # ranks transformed to uniforms
+fit_gauss_pm <- fitCopula(normalCopula(dim = 2), pseudo_uv, method = "ml")
+fit_t_pm     <- fitCopula(tCopula(dim = 2, dispstr = "un"),
+                          pseudo_uv, method = "ml", start = start_t)
+fits_arch_pm <- lapply(
+  list("frank"   = frankCopula(dim = 2),
+       "clayton" = claytonCopula(dim = 2),
+       "gumbel"  = gumbelCopula(dim = 2),
+       "joe"     = joeCopula(dim = 2)),
+  fitCopula, data = pseudo_uv, method = "ml"
+)
+```
+
+```{r mle-vs-pmle-comparison, cache=TRUE, echo=FALSE,, results='asis'}
+# Compare parameter estimates from full MLE vs PMLE
+copula_list_mle  <- list(
+  Gaussian = fit_gauss,
+  t        = fit_t,
+  frank    = fits_arch$frank,
+  clayton  = fits_arch$clayton,
+  gumbel   = fits_arch$gumbel,
+  joe      = fits_arch$joe
+)
+copula_list_pmle <- list(
+  Gaussian = fit_gauss_pm,
+ "t-Student"= fit_t_pm,
+  frank    = fits_arch_pm$frank,
+  clayton  = fits_arch_pm$clayton,
+  gumbel   = fits_arch_pm$gumbel,
+  joe      = fits_arch_pm$joe
+)
+
+# Extract and format parameter vectors
+params_mle  <- sapply(copula_list_mle, function(x) paste0(round(coef(x), 3), collapse = ", "))
+params_pmle <- sapply(copula_list_pmle, function(x) paste0(round(coef(x), 3), collapse = ", "))
+
+# Build and print comparison table
+comparison <- data.frame(
+  Model = names(params_mle),
+  MLE   = unname(params_mle),
+  PMLE  = unname(params_pmle),
+  row.names = NULL
+)
+
+print(
+  format_table(
+    comparison,
+    caption = "Comparison of Full MLE vs PMLE Parameter Estimates",
+    align   = c("l", "c", "c")
+  )
+)
+```
+
+Across all six copulas, PMLE yields parameter estimates that are either nearly identical or slightly more conservative than full MLE, reflecting its robustness to marginal misspecification.
+
+In the **Gaussian** case, the correlation drops only from `r round(coef(fit_gauss)[1], 3)` to `r round(coef(fit_gauss_pm)[1], 3)`, indicating negligible efficiency loss. For the **Student‑t** copula, PMLE reduces both the dependence parameter (`r round(coef(fit_t)[1], 3)` → `r round(coef(fit_t_pm)[1], 3)`) and the degrees of freedom (`r round(coef(fit_t)[2], 3)` → `r round(coef(fit_t_pm)[2], 3)`), suggesting heavier tail-dependence when margins are estimated nonparametrically. Among the Archimedeans, **Frank’s** θ decreases from `r round(coef(fits_arch$frank)[1], 3)` to `r round(coef(fits_arch_pm$frank)[1], 3)`, **Gumbel’s** from `r round(coef(fits_arch$gumbel)[1], 3)` to `r round(coef(fits_arch_pm$gumbel)[1], 3)`, and **Joe’s** from `r round(coef(fits_arch$joe)[1], 3)` to `r round(coef(fits_arch_pm$joe)[1], 3)`—each reflecting a moderate reduction in implied dependence. **Clayton** remains stable at `r round(coef(fits_arch$clayton)[1], 3)`, demonstrating strong robustness to marginal specification.
+
+Overall, PMLE produces slightly lower dependence parameters, particularly for tail‐sensitive copulas, suggesting that a rank‐based approach may guard against overestimating joint extremes when the marginal GARCH models are not perfectly specified.
+
+------------------------------------------------------------------------
+
+## 7. Empirical Tail Probability vs. Copula-Implied Values
+
+To focus on the critical region of joint downside risk, we compute:
+
+-   the **empirical estimate** of $\Pr(U < 0.05, V < 0.05)$ via the observed frequency of PIT pairs, and
+
+-   the **theoretical values** implied by each fitted copula model.
+
+```{r EmpiricalvsTheoretical, cache=TRUE, echo=FALSE, results='asis'}
+# Empirical estimate of joint lower tail probability
+p_hat <- mean(u < 0.05 & v < 0.05)
+se_hat <- sqrt(p_hat * (1 - p_hat) / length(u))
+
+pars_t <- coef(fit_t) 
+copula_t_fit <- tCopula(param = pars_t["rho.1"], dim = 2, df = 13 , dispstr = "un")
+
+# Theoretical values from fitted copulas
+set.seed(123)
+#Gaussian
+p_gauss   <- pCopula(c(0.05, 0.05), fit_gauss@copula)
+# Student‑t via pmvt
+p_t <- pCopula(c(0.05, 0.05), copula_t_fit)
+#Archimedeans
+p_clayton <- pCopula(c(0.05, 0.05), fits_arch$clayton@copula)
+p_gumbel  <- pCopula(c(0.05, 0.05), fits_arch$gumbel@copula)
+p_frank  <- pCopula(c(0.05, 0.05), fits_arch$frank@copula)
+p_joe  <- pCopula(c(0.05, 0.05), fits_arch$joe@copula)
+
+empirical <- data.frame(
+  "P(U < 0.05, V < 0.05)" = p_hat,
+  S.E. = se_hat,
+  check.names = FALSE
+)
+
+results <- data.frame(
+  Copula = c( "Gaussian", "Student-t", "Clayton", "Gumbel", "Frank", "Joe"),
+  "P(U < 0.05, V < 0.05)" = c( p_gauss, p_t, p_clayton, p_gumbel, p_frank, p_joe),
+  check.names = FALSE
+  )
+
+print(
+  format_table(
+    empirical,
+    caption = "Empirical estimate of joint lower tail probability",
+    digits  = 4,
+    align   = c("l", "r")
+  )
+)
+
+print(
+  format_table(
+    results,
+    caption = "Theoretical values from fitted Copulas",
+    digits  = 4,
+    align   = c("l", "r")
+  )
+)
+```
+
+The empirical probability of observing a joint extreme event, $\Pr(U < 0.05, V < 0.05)$, is estimated at `r round(p_hat, 4)` (SE = `r round(se_hat, 4)`), serving as a benchmark for assessing the accuracy of each copula model in capturing lower-tail dependence.
+
+Among the copula models, the **Clayton** copula yields the highest predicted tail probability (`r round(p_clayton, 4)`), significantly overshooting the empirical benchmark due to its inherent lower-tail dependence. The **Student‑t** copula estimates a value of (`r round(p_t, 4)`), closely matching the observed data and indicating a balanced representation of joint downside risk. In contrast, **Gaussian**, **Gumbel**, **Frank** and **Joe** copulas substantially underestimate the joint tail risk, with respective probabilities of `r round(p_gauss, 4)`, `r round(p_gumbel, 4)`, `r round(p_frank, 4)`, and `r round(p_joe, 4)`. These models either lack lower-tail dependence by construction (e.g., Gaussian, Frank, Joe) or place insufficient mass in the lower tail (e.g., Gumbel).
+
+These findings reinforce the Student‑t copula as the most reliable for modeling joint downside risk without gross bias, while the Clayton copula—despite its tendency to overstate extreme co-movement—remains valuable in stress-testing scenarios where conservative risk estimates are required.
+
+------------------------------------------------------------------------
+
+## 8. Visualization
+
+To assess how well each fitted copula captures the joint dependence structure between the two assets, we compare the copula-implied density to the empirical joint behavior of the data. This is done using transformed residuals from the GARCH models (PITs), visualized on the unit square.
+
+-   **Point cloud**—PITs (Probability Integral Transforms) of standardized GARCH residuals. These represent the real data mapped to $[0,1]^2$.
+
+-   **Density contours**—filled polygons of the empirical joint distribution $\hat f_{UV}(u,v)$ estimated via a two‑dimensional Gaussian kernel: $$ \hat f_{UV}(u,v) = \frac{1}{nh_u h_v}\sum_{t=1}^{n} K\!\Bigl(\tfrac{u-u_t}{h_u},\tfrac{v-v_t}{h_v}\Bigr), $$ where $K$ is the standard‑normal kernel and $h_u,h_v$ are bandwidths chosen by the Scott rule.
+
+-   **Red lines:** Theoretical density contours implied by each fitted copula, i.e. level sets of $c_\theta(u,v)$.
+
+```{r 2d_scatter, fig.width = 12, fig.height = 6, cache=TRUE, echo=FALSE}
+# 2D scatter with density contours
+df_uv <- data.frame(u = u, v = v)
+grid <- expand.grid(
+  u = seq(0.01, 0.99, length = 50),
+  v = seq(0.01, 0.99, length = 50)
+)
+dens_grid <- cbind(grid$u, grid$v)
+
+# Helper function for plotting empirical + theoretical contours
+plot_with_copula <- function(copula_fit, title) {
+  df_dens <- data.frame(grid, z = dCopula(dens_grid, copula_fit@copula))
+  
+  ggplot(df_uv, aes(u, v)) +
+    # Add empirical scatter (gray points)
+    geom_point(aes(color = "Empirical Data"), alpha = 0.3, size = 1, show.legend = TRUE) +
+    
+    # Add empirical density
+    stat_density_2d(aes(fill = after_stat(level)), geom = "polygon", alpha = 0.3, show.legend = TRUE) +
+    
+    # Add theoretical copula contours
+    geom_contour(data = df_dens, aes(x = u, y = v, z = z, color = "Theoretical Contour"),
+                 bins = 6, linewidth = 0.5, show.legend = TRUE) +
+    
+    # Color and fill scales
+    scale_color_manual(
+      name = "Contour Type",
+      values = c("Empirical Data" = "grey50", "Theoretical Contour" = "red"),
+      labels = c(
+        "Empirical Data" = "Gray dots: PITs from GARCH residuals",
+        "Theoretical Contour" = "Red line: Copula-implied density levels"
+      )
+    ) +
+    scale_fill_viridis_c(name = "Empirical Density Level", option = "rocket") +
+    
+    labs(
+      title = title,
+      x = "u (S&P 500)", y = "v (STOXX 600)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+
+# Plots for different copula models
+p1 <- plot_with_copula(fit_gauss,   "Gaussian Copula")
+p2 <- plot_with_copula(fit_t,       "Student-t Copula ")
+p3 <- plot_with_copula(fits_arch$clayton, "Clayton Copula ")
+p4 <- plot_with_copula(fits_arch$gumbel,  "Gumbel Copula ")
+p5 <- plot_with_copula(fits_arch$frank,  "Frank Copula")
+p6 <- plot_with_copula(fits_arch$joe,  "Joe Copula")
+
+subtitle_elliptical <- ggplot() + 
+  annotate("text", x = 0.1, y = 0.5, label = "Elliptical Copulas", size = 5, fontface = "bold") +
+  theme_void()
+
+subtitle_archimedean <- ggplot() + 
+  annotate("text", x = 0.1, y = 0.5, label = "Archimedean Copulas", size = 5, fontface = "bold") +
+  theme_void()
+
+layout_grid <- (
+  (plot_spacer() | subtitle_elliptical | plot_spacer()) /
+  (p1 | p2 | guide_area()) /
+  (plot_spacer() | subtitle_archimedean | plot_spacer()) /
+  (p3 | p4 | p5 |p6)
+) +
+  plot_layout(guides = "collect", heights = c(0.1, 1, 0.1, 1)) &
+  theme(
+    legend.justification = c(0, 1)
+    )
+
+layout_grid + 
+  plot_annotation(
+    title = "Empirical vs Copula-Implied Contours",
+    theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+  )
+```
+
+### 8.1 Interpretation of Density Plots
+
+-   **Gaussian Copula**: Captures central dependence, but due to its elliptical symmetry and zero tail dependence, it underestimates co-movement in the extremes. The density contours fail to align with the concentration of points in the lower-left and upper-right corners, revealing its inability to reflect joint crashes or rallies.
+
+-   **Student‑t Copula**: Provides the best overall alignment, capturing both the central mass and tail structure effectively. Its contours match the curvature of the empirical KDE in both lower and upper tails, reflecting symmetric tail dependence. This model adapts well to both normal and extreme co-movement patterns in the data.
+
+-   **Clayton Copula**: Displays pronounced clustering in the lower-left quadrant, consistent with its lower-tail dependent structure. However, the density levels in this region are too concentrated, suggesting that the model overstates the frequency and intensity of joint downside events.
+
+-   **Gumbel Copula**: Exhibits upper-tail dependence, with slight contour inflation in the upper-right region. However, it fails to capture the lower tail entirely, and its overall shape underrepresents the spread of the joint distribution, limiting its effectiveness in modeling crashes.
+
+-   **Frank Copula**: Yields a symmetric but shallow dependence structure, resulting in contours that are misaligned with both tail clusters and slightly too stretched diagonally. It lacks the flexibility to capture tail co-movements and performs poorly in matching both joint crashes and rallies.
+
+-   **Joe**: Strongly emphasizes upper-tail dependence, with contours sharply expanding in the upper-right quadrant. However, it performs poorly elsewhere—missing both the central bulk and lower-tail entirely. It is therefore only suitable for modeling joint rallies, not for general dependence or downside risk.
+
+------------------------------------------------------------------------
+
+## 9. Final Model Selection
+
+The combined evidence clearly indicates that **Student-t** copula clearly outperforms all others, ranking first by AIC, satisfying concordance checks, and delivering a balanced lower-tail fit. This combination of central-mass accuracy and tail sensitivity makes it the most appropriate specification for our equity returns.
+
+For robustness, the **Clayton** copula can be employed to stress-test extreme downside scenarios, despite its known tendency to overstate co-crash probabilities. By contrast, models such as **Gaussian**, **Frank**, **Joe**, and **Gumbel** either lack sufficient tail flexibility to capture the observed dependence structure or fail one or more concordance tests, and thus are insufficiently flexible to capture the observed dependence structure in the extremes.
+
+The resulting copula parameter estimates will be used to simulate joint innovations in the next section.
+
+## 10. Monte Carlo Simulation of Joint Tail Risk
+
+The final step of our analysis involves performing a Monte Carlo simulation to estimate the joint tail risk between the two equity indices. Given the fitted Copula-GARCH model, the simulation generates realistic joint return scenarios, explicitly capturing both conditional volatility dynamics and the tail dependence structure modeled by the selected Student-t copula.
+
+### 10.1 General Simulation Framework
+
+Using the Student-t copula parameters estimated in Section 9, we simulate $N = 10{,}000$ joint draws $(U_t, V_t)$ to quantify the probability of simultaneous 95% losses, and compare this to the independence benchmark.
+
+Standard Value-at-Risk (VaR) measures how much a single asset might lose under normal conditions with 95% confidence. However, adding two VaRs assumes the underlying assets behave independently—even in the tails. This assumption is often unrealistic in financial markets, where panic and contagion cause co-movements in downturns. The true risk to a diversified portfolio is not that one index falls, but that both fall together.
+
+To capture this hidden vulnerability, we simulate a large number of alternate market scenarios using a Copula-GARCH framework, which models:
+
+• GARCH: time-varying volatility for each index, and
+
+• Copula: nonlinear dependence between them, especially during stress.
+
+Let $r_{1,t}, r_{2,t}$ denote the one-step-ahead conditional return forecasts for the two assets, as modeled by the Copula-GARCH framework. The simulation process follows a four-stage structure:
+
+```{r sim-process, cache=TRUE, echo=FALSE, results='asis'}
+print(
+  format_table(
+    data.frame(
+      Description = c(
+        "**1. Dependence Simulation**: Generate N pairs of uniforms from the fitted copula to capture dependence.",
+        "**2. Marginal Transformation**: Transform uniform variates into standardized shocks via inversion of the estimated marginal innovation distributions, consistent with the fitted GARCH(1,1) models.",
+        "**3. Rescaling to Returns**: Scale shocks by conditional volatilities from the fitted GARCH models to obtain simulated next-period returns.",
+        "**4. Joint-tail test:** Re-estimate each asset’s 95 % VaR from its own simulated returns, then record the frequency with which *both* returns breach their respective VaRs."
+      ),
+      `Mathematical Expression` = c(
+        "$(U_1^{(j)}, U_2^{(j)}) \\sim C_{\\hat{\\theta}}$",
+        "$Z_i^{(j)} = F_{Z_i}^{-1}(U_i^{(j)})$",
+        "$r_{i,t+1}^{(j)} = \\mu_i + \\sigma_{i,t} Z_i^{(j)}$",
+        "$\\widehat{p}_{\\mathrm{joint}} = \\frac{1}{N} \\sum_{j=1}^N \\mathbf{1}\\Bigl( r_{1,t+1}^{(j)}$ < $\\mathrm{VaR}_{1,0.95},r_{2,t+1}^{(j)}$ < $\\mathrm{VaR}_{2,0.95} \\Bigr)$"      
+        )
+    ),
+    caption = "Simulation Steps for Joint-Tail Probability Estimation",
+    digits  = 4,
+    align   = c("l", "l")
+  )
+)
+```
+
+> ***Why re-estimate the VaRs in Step 4?***\
+> The simulated world features random volatility and fat tails. So we define “extreme loss” in context — each VaR\* is the 5th percentile of that index’s own simulated outcomes. This ensures each index breaches its own VaR\* exactly 5% of the time by design. Any excess over the independence benchmark $(p_\text{ind}=0.05^2=0.0025)$ is therefore attributable **solely to tail dependence**.
+
+The empirical estimate $\hat{p}$ is then compared to the theoretical benchmark under the assumption of independence:
+
+$p_{\text{ind}} = \mathbb{P}(r_1 \leq VaR_1) \cdot \mathbb{P}(r_2 \leq VaR_2) = 0.05 \times 0.05 = 0.0025$
+
+If the observed joint tail probability $\hat{p}$ significantly exceeds this benchmark—typically, more than twice as large—it indicates that the independence assumption **understates the true portfolio tail risk**:
+
+$\text{If } \hat{p} \gg p_{\text{ind}}, \text{ then marginal VaRs underestimate joint risk.}$
+
+Conversely, if $\hat{p} \approx p_{\text{ind}}$, the independence assumption may be considered a reasonable approximation.
+
+```{r montecarlo-draws, cache=TRUE, echo=FALSE}
+set.seed(123)                   # reproducibility
+n_sims <- 10000                 # number of scenarios
+uv_sim <- rCopula(n_sims, fit_t@copula)   # Student‑t copula draws
+u1 <- uv_sim[, 1]
+u2 <- uv_sim[, 2]
+```
+
+```{r inverse-innovations, cache=TRUE, echo=FALSE}
+# ---- Transform copula uniforms to innovations z_i ----
+get_dist_pars <- function(fit){
+  cf   <- coef(fit)
+  keep <- intersect(names(cf), c("shape", "skew", "nu", "shape1", "shape2", "lambda", "ghlambda", "xi"))
+  as.list(cf[keep])
+}
+
+# Thin wrapper around rugarch::qdist
+qdist_wrap <- function(dist, p, pars){
+  do.call(rugarch::qdist,
+          c(list(distribution = dist, p = p, mu = 0, sigma = 1), pars))
+}
+
+# --- S&P 500 (NIG innovations) ---
+dist_sp   <- fit_sp@model$modeldesc$distribution  # "nig"
+pars_sp   <- get_dist_pars(fit_sp)
+
+# --- STOXX 600 (NIG innovations) ---
+dist_stoxx <- fit_stoxx@model$modeldesc$distribution  # "nig"
+pars_stoxx <- get_dist_pars(fit_stoxx)
+
+# Quantile transformation: z_i = F_{z_i}^{-1}(u_i)
+z1 <- qdist_wrap(dist_sp,    u1, pars_sp)
+z2 <- qdist_wrap(dist_stoxx, u2, pars_stoxx)
+```
+
+```{r simulate-returns, cache=TRUE, echo=FALSE}
+# ---- Conditional volatilities σ_{i,t} and means μ_i ----
+sigma_sp_last    <- as.numeric(tail(sigma(fit_sp),    1))
+sigma_stoxx_last <- as.numeric(tail(sigma(fit_stoxx), 1))
+mu_sp    <- 0      # include.mean = FALSE in ugarchspec
+mu_stoxx <- 0
+
+# ---- Simulated next-day returns ----
+r1_sim <- mu_sp    + sigma_sp_last    * z1
+r2_sim <- mu_stoxx + sigma_stoxx_last * z2
+
+# ---- Path-wise 5 % quantile (keeps marginal breach = 5 %) ----
+VaR1_95 <- quantile(r1_sim, probs = 0.05, names = FALSE)
+VaR2_95 <- quantile(r2_sim, probs = 0.05, names = FALSE)
+
+#joint-prob
+N_joint <- sum(r1_sim <= VaR1_95 & r2_sim <= VaR2_95)
+phat    <- N_joint / n_sims
+
+#independence benchmark
+p_ind <- 0.05 * 0.05   # 0.0025
+```
+
+```{r summary, echo=FALSE, results='asis'}
+# prepare a little summary table
+sim_tbl <- data.frame(
+  Metric = c(
+    "Estimated joint tail probability",
+    "Independence benchmark (0.05²)",
+    "Ratio (observed / independent)"
+  ),
+  Value = c(
+    sprintf("%.4f", phat),
+    sprintf("%.4f", p_ind),
+    sprintf("%.1f×", phat / p_ind)
+  ),
+  check.names      = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# print it with your helper
+print(
+  format_table(
+    sim_tbl,
+    caption = "Simulation-based joint tail probability vs independence benchmark",
+    align   = c("l", "r")
+  )
+)
+
+```
+
+The Monte Carlo simulation reveals a joint tail probability of 1.63%, significantly higher than the 0.25% expected under independence. This 6.5× multiplier reflects the true portfolio exposure to extreme co-movements, a tail-dependence penalty that standard VaR measures fail to capture. It quantifies how much more likely the portfolio is to experience a simultaneous 95% drawdown across both assets than a naïve, independence-based model would suggest.
+
+## 11. Copula-Based Tail Probabilities as Relative-Value Indicators
+
+Building on this evidence, we turn to the question of **how to exploit tail‑risk asymmetry through tactical relative‑value positioning and conditional hedging.**
+
+The Copula‑GARCH framework serves a dual purpose:
+
+1.  Quantify aggregate joint risk by modelling the entire dependence structure, including asymmetric tails.
+
+2.  Assess relative‑value by contrasting conditional tail probabilities. During stress episodes, the asset with the lower probability of distress conditional on weakness in the other is interpreted as relatively more resilient.
+
+This insight motivates three tactical responses:
+
+-   **Reallocate** toward the more resilient asset.
+
+-   **Hedge** exposure to the more vulnerable one.
+
+-   **Embed** tail‑dependence triggers in risk limits and allocation rules.
+
+Such adjustments sharpen downside protection while preserving capital efficiency, especially in portfolios exposed to non‑linear co‑movement risk.
+
+### 11.1 Trading Signal Generation Based on Copula-Implied Tail Risk
+
+This subsection details how relative‑value trading signals and hedge sizes are derived from simulated joint returns under the fitted Student‑t copula.
+
+Let
+
+-   $r_{1,t+1}^{(j)}$, $r_{2,t+1}^{(j)}$: be the j-th Monte‑Carlo draw of next‑day returns,
+-   $u_1^{(j)}$, $u_2^{(j)}$: Corresponding copula-uniform values
+-   $N = 100,000$: Number of Monte Carlo draws
+-   $\alpha = 0.05$: Significance level used to define extreme tail regions.
+
+#### Conditional Tail Probabilities
+
+Using the simulated pseudo-observations $(u_1^{(j)}, u_2^{(j)})$, we estimate the following conditional probabilities:
+
+-   $\hat{p}_{1|2} = P(U_1 \le u_1 \mid U_2 = u_2)$
+-   $\hat{p}_{2|1} = P(U_2 \le u_2 \mid U_1 = u_1)$
+
+These probabilities measure the likelihood that one asset falls into its own lower tail conditional on the state of the other; extreme cross‑tail values flag **short‑term pricing dislocations.**
+
+**Trading Signal Rules**
+
+We **act** **only when both of the following conditions are satisfied**:
+
+```{r conditional-signals, echo=FALSE, results='asis', fig.width = 12, fig.height = 6, warning=FALSE}
+print(
+  format_table(
+    data.frame(
+      `Condition 1` = c(
+        "$P(U_1 \\le u_1 \\mid U_2 = u_2)$ < $\\alpha$ → Asset 1 is undervalued",
+        "$P(U_1 \\le u_1 \\mid U_2 = u_2)$ > $1 - \\alpha$ → Asset 1 is overvalued",
+        "Else"
+      ),
+      `Condition 2` = c(
+        "$P(U_2 \\le u_2 \\mid U_1 = u_1)$ > $1 - \\alpha$ → Asset 2 is overvalued",
+        "$P(U_2 \\le u_2 \\mid U_1 = u_1)$ < $\\alpha$ → Asset 2 is undervalued",
+        ""
+      ),
+      Signal = c(
+        "Long Asset 1 / Short Asset 2",
+        "Short Asset 1 / Long Asset 2",
+        "No position"
+      )
+    ),
+    caption = "Trading Signal Based on Conditional Tail Probabilities",
+    align = c("l", "l", "c")
+  )
+)
+```
+
+Position sizes may be scaled by $1/ \sigma_t$— the ex‑ante portfolio volatility — or by targeting a fixed risk budget, ensuring adaptive exposure.
+
+These conditional probabilities act as **indicators of relative mispricing**, capturing how unusual one asset’s position is **given** the state of the other under the copula-implied joint distribution.
+
+### 11.2 Performance Metrics and P&L Summary
+
+The strategy is back‑tested on daily total‑return series for Asset 1 (S&P 500) and Asset 2 (STOXX Europe 600) from 1 January 2010 to 31 March 2025 (≈3800 observations). We align the generated trading signals with the subsequent day’s log returns for Asset 1 and Asset 2.
+
+```{r conditional-probs, echo=FALSE, results='asis', fig.width = 12, fig.height = 6, warning=FALSE}
+# ---- Use precomputed uniform pseudo-observations ----
+u1_real <- uv[,1]  # first column of uv
+u2_real <- uv[,2]  # second column of uv
+
+# ---- Align dates ----
+dates <- zoo::index(z_sp)
+
+# ---- Signal parameters ----
+alpha          <- 0.05
+threshold_low  <- alpha
+threshold_high <- 1 - alpha
+
+# ---- Extract parameters from previously fitted t-copula ----
+rho <- coef(fit_t)["rho.1"]
+df  <- coef(fit_t)["df"]
+
+# ---- Compute conditional probabilities using the fitted t-copula ----
+n_obs <- length(u1_real)
+p_u1_given_u2 <- numeric(n_obs)
+p_u2_given_u1 <- numeric(n_obs)
+
+for(i in seq_len(n_obs)) {
+  p_u1_given_u2[i] <- BiCopHfunc2(u1_real[i], u2_real[i],
+                                  family = 2, par = rho, par2 = df)
+  p_u2_given_u1[i] <- BiCopHfunc1(u1_real[i], u2_real[i],
+                                  family = 2, par = rho, par2 = df)
+}
+
+# ---- Generate signals ----
+signal <- rep("no_position", n_obs)
+
+# Long Asset 1 / Short Asset 2:
+# When P(U1 ≤ u1 | U2 = u2) < α AND P(U2 ≤ u2 | U1 = u1) > 1−α
+signal[p_u1_given_u2 < threshold_low & p_u2_given_u1 > threshold_high] <- "long_1_short_2"
+
+# Short Asset 1 / Long Asset 2:
+# When P(U1 ≤ u1 | U2 = u2) > 1−α AND P(U2 ≤ u2 | U1 = u1) < α
+signal[p_u1_given_u2 > threshold_high & p_u2_given_u1 < threshold_low] <- "short_1_long_2"
+
+signal_df <- data.frame(
+  Date            = dates,
+  U1              = round(u1_real,         4),
+  U2              = round(u2_real,         4),
+  P_U1_given_U2   = round(p_u1_given_u2,   4),
+  P_U2_given_U1   = round(p_u2_given_u1,   4),
+  Signal          = signal,
+  stringsAsFactors = FALSE
+) %>%
+  arrange(desc(Date))
+
+# ---- Plot conditional regions ----
+# 1) compute the four frontiers
+boundary1_long <- data.frame(U2 = seq(0.01, 0.99, length.out = 300))
+boundary1_long$U1 <- sapply(boundary1_long$U2, function(u2) {
+  uniroot(function(u1)
+            BiCopHfunc2(u1, u2, family = 2, par = rho, par2 = df) - alpha,
+          c(1e-3, 1-1e-3))$root
+})
+boundary2_long <- data.frame(U1 = seq(0.01, 0.99, length.out = 300))
+boundary2_long$U2 <- sapply(boundary2_long$U1, function(u1) {
+  uniroot(function(u2)
+            BiCopHfunc1(u1, u2, family = 2, par = rho, par2 = df) - threshold_high,
+          c(1e-3, 1-1e-3))$root
+})
+boundary1_short <- data.frame(U2 = seq(0.01, 0.99, length.out = 300))
+boundary1_short$U1 <- sapply(boundary1_short$U2, function(u2) {
+  uniroot(function(u1)
+            BiCopHfunc2(u1, u2, family = 2, par = rho, par2 = df) - threshold_high,
+          c(1e-3, 1-1e-3))$root
+})
+boundary2_short <- data.frame(U1 = seq(0.01, 0.99, length.out = 300))
+boundary2_short$U2 <- sapply(boundary2_short$U1, function(u1) {
+  uniroot(function(u2)
+            BiCopHfunc1(u1, u2, family = 2, par = rho, par2 = df) - alpha,
+          c(1e-3, 1-1e-3))$root
+})
+# 2) build the two ribbons
+inv1 <- approx(x = boundary1_long$U1, y = boundary1_long$U2,
+               xout = boundary2_long$U1, rule = 2)$y
+ribbon_long <- data.frame(
+  U1       = boundary2_long$U1,
+  U2_lower = boundary2_long$U2,
+  U2_upper = inv1
+)
+
+inv2 <- approx(x = boundary1_short$U1, y = boundary1_short$U2,
+               xout = boundary2_short$U1, rule = 2)$y
+ribbon_short <- data.frame(
+  U1       = boundary2_short$U1,
+  U2_lower = inv2,
+  U2_upper = boundary2_short$U2
+)
+
+# 3) compute the “envelope” under the intersection
+envelope_long <- data.frame(
+  U1    = ribbon_long$U1,
+  U2_env = pmax(ribbon_long$U2_lower, ribbon_long$U2_upper)
+)
+envelope_short <- data.frame(
+  U1    = ribbon_short$U1,
+  U2_env = pmin(ribbon_short$U2_lower, ribbon_short$U2_upper)
+)
+
+# 4) plot everything
+ggplot() +
+  geom_ribbon(
+    data = envelope_long,
+    aes(
+      x    = U1,
+      ymin = U2_env,
+      ymax = 1,
+      fill = "long"
+    ),
+    alpha = 0.25
+  ) +
+  geom_ribbon(
+    data = envelope_short,
+    aes(
+      x    = U1,
+      ymin = 0,
+      ymax = U2_env,
+      fill = "short"
+    ),
+    alpha = 0.25
+  ) +
+  geom_path(data = boundary1_long,  aes(x = U1, y = U2), color = "#00008B", size = 0.8) +
+  geom_path(data = boundary2_long,  aes(x = U1, y = U2), color = "#00008B", size = 0.8) +
+  geom_path(data = boundary1_short, aes(x = U1, y = U2), color = "#9e0142", size = 0.8) +
+  geom_path(data = boundary2_short, aes(x = U1, y = U2), color = "#9e0142", size = 0.8) +
+  geom_point(
+    data = signal_df,
+    aes(x = U1, y = U2, color = Signal),
+    size  = 1.8,
+    alpha = 0.7
+  ) +
+  scale_fill_manual(
+    name = "Conditional regions",
+    values = c(long  = "#00008B", short = "#9e0142"),
+    breaks = c("long", "short"),
+    labels = c(
+      "Long region:\nP(U1 ≤ u1 | U2 = u2) < α\n& P(U2 ≤ u2 | U1 = u1) > 1−α",
+      "Short region:\nP(U1 ≤ u1 | U2 = u2) > 1−α\n& P(U2 ≤ u2 | U1 = u1) < α"
+    )
+  ) +
+  scale_color_manual(
+    name   = "Signal",
+    values = c(
+      long_1_short_2  = "#00008B",
+      short_1_long_2 = "#9e0142",
+      no_position    = "grey70"
+    ),
+    breaks = c("long_1_short_2", "short_1_long_2", "no_position"),
+    labels = c(
+      "Long Asset1 / Short Asset2",
+      "Short Asset1 / Long Asset2",
+      "No Position"
+    )
+  ) +
+  labs(
+    title = "Pairs-Trading Signals: t-Copula Conditional Regions",
+    x     = expression(U[1]),
+    y     = expression(U[2])
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    legend.title    = element_text(face = "bold")
+  )
+
+# ---- Table of active signals, 5 most recent only ----
+active_df <- signal_df %>%
+  filter(Signal != "no_position") %>%
+  group_by(Date) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(desc(Date)) %>%
+  slice_head(n = 5) %>%
+  transmute(
+    Date,
+    `P(U1 ≤ u1 | U2 = u2)` = round(P_U1_given_U2, 4),
+    `P(U2 ≤ u2 | U1 = u1)` = round(P_U2_given_U1, 4),
+    Signal = recode(
+      Signal,
+      long_1_short_2  = "Long Asset1 / Short Asset2",
+      short_1_long_2 = "Short Asset1 / Long Asset2"
+    )
+  )
+
+print(
+  format_table(
+    active_df,
+    caption = "Most Recent 5 Active Trading Signals",
+    digits  = 4,
+    align   = c("l", "r", "r", "l")
+  )
+)
+
+# ---- Historical counts of all signal types ----
+count_df <- signal_df %>%
+  mutate(
+    Signal = recode(
+      Signal,
+      long_1_short_2  = "Long Asset1 / Short Asset2",
+      short_1_long_2 = "Short Asset1 / Long Asset2",
+      no_position    = "No Position"
+    )
+  ) %>%
+  count(Signal, name = "Count")
+
+print(
+  format_table(
+    count_df,
+    caption = "Historical Counts by Signal Type",
+    align   = c("l", "r")
+  )
+)
+
+```
+
+The strategy, derived from the fitted Student‑t copula, demonstrates a high degree of selectivity. Out of 3,755 total observations, only 102 signals were triggered—49 indicating a Long Asset 1 (S&P 500) / Asset 2 (STOXX Europe 600) position, and 53 suggesting the opposite. In the remaining 97% of cases, no position was taken. This outcome underscores the stringency of the chosen tail thresholds (α = 0.05), which are designed to isolate extreme joint tail events.
+
+The most recent signals reinforce the presence of asymmetric tail dependence, with clear instances of conditional probabilities breaching the decision thresholds. These results suggest that the model is effective in capturing rare but potentially exploitable relative-value dislocations.
+
+Daily profit and loss (PnL) is computed based on relative-value positioning: going long the undervalued asset and short the overvalued one, as indicated by the copula-implied conditional tail probabilities. Specifically, the daily PnL is calculated as:
+
+$$
+\text{PnL}_t =
+\begin{cases}
+r_{1,t} - r_{2,t} & \text{if Long Asset 1 / Short Asset 2} \\
+r_{2,t} - r_{1,t} & \text{if Short Asset 1 / Long Asset 2} \\
+0 & \text{otherwise}
+\end{cases}
+$$
+
+From this, we construct the cumulative PnL time series as:
+
+$$
+\text{Cumulative PnL}t = \prod{s=1}^{t} (1 + \text{PnL}_s) - 1
+$$
+
+```{r pnl-calculation, echo=FALSE, warning=FALSE, message=FALSE, fig.width = 12, fig.height = 6,  results='asis'}
+# align signals (at t) with next-day returns (t+1)
+signal_lead <- signal_df %>%
+  transmute(
+    Date   = Date,
+    Signal = Signal
+  ) %>%
+  arrange(Date) %>%
+  mutate(Date = lead(Date))
+
+# merge with actual log-returns
+pnl_df <- ret_data %>%
+  fortify.zoo(name = "Date") %>%
+  rename(R1 = SP, R2 = STOXX) %>%
+  inner_join(signal_lead, by = "Date") %>%
+  mutate(
+    # compute PnL: long1/short2 => R1 - R2; short1/long2 => R2 - R1; no_position => 0
+    PnL = case_when(
+      Signal == "long_1_short_2"  ~ R1 - R2,
+      Signal == "short_1_long_2"  ~ R2 - R1,
+      TRUE                         ~ 0
+    )
+  )
+# PnL time series
+pnl_xts     <- xts::xts(pnl_df$PnL, order.by = as.Date(pnl_df$Date))
+cumulative  <- cumprod(1 + pnl_xts) - 1
+last_pnl    <- as.numeric(last(cumulative))
+
+cum_df <- data.frame(Date = as.character(index(cumulative)), Cumulative = coredata(cumulative)) %>%
+  arrange(desc(Date))
+print(format_table(cum_df %>%
+    arrange(desc(Date)) %>%
+    { rbind(head(., 3), data.frame(Date = "...", Cumulative = "..."), tail(., 3)) },
+  caption = "Cumulative PnL of Pair Strategy (summary view)",
+  digits  = 4, align   = c("l","r")))
+
+# prepare data frame
+plot_df <- data.frame(
+  Date       = index(cumulative),
+  Cumulative = coredata(cumulative)
+) %>%
+  arrange(Date)
+
+ggplot(plot_df, aes(x = Date, y = Cumulative)) +
+  geom_line(size = 0.8, color = "#2B3A67") +
+  labs(
+    title = "Cumulative PnL of Pair Strategy",
+    x     = "Date",
+    y     = "Cumulative PnL"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+We then evaluate the strategy’s performance across three key dimensions:
+
+#### (1) Return-based metrics:
+
+-   **Total PnL:** $\text{Cumulative PnL}_T$
+
+-   **Mean daily return:** $\mu = \frac{1}{T} \sum_{t=1}^{T} \text{PnL}_t$
+
+-   **Sharpe ratio:** $\text{SR} = \frac{\mu}{\sigma} \sqrt{252}$
+
+    ```{r Performance-Metrics, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+    # 1) Performance Metrics
+    mean_daily  <- mean(pnl_xts)
+    sd_daily    <- sd(pnl_xts)
+    sharpe      <- mean_daily / sd_daily * sqrt(252)
+
+    perf_df <- data.frame(
+      Metric = c("Total PnL", "Mean Daily Return", "Sharpe Ratio"),
+      Value  = c(last_pnl, mean_daily, sharpe)
+    )
+    print(format_table(perf_df, caption = "Performance Metrics", digits = 4, align = c("l","r")))
+    ```
+
+#### (2) Trade-level statistics
+
+-   **Win rate**: proportion of profitable trades
+
+-   **Average trade PnL**: conditional mean of $\text{PnL}_t$ when a signal is active
+
+-   **Profit factor:** $\frac{\sum \text{PnL}{+}}{|\sum \text{PnL}{-}|}$
+
+```{r Trade-Level-Metrics, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+# 2) Trade-Level Metrics
+n_trades       <- sum(pnl_df$Signal != "no_position")
+win_rate       <- mean(pnl_df$PnL[pnl_df$Signal != "no_position"] > 0)
+avg_trade_pnl  <- mean(pnl_df$PnL[pnl_df$Signal != "no_position"])
+profit_factor  <- sum(pnl_df$PnL[pnl_df$PnL > 0]) / abs(sum(pnl_df$PnL[pnl_df$PnL < 0]))
+
+trade_df <- data.frame(
+  Metric = c("Number of Trades", "Win Rate", "Avg PnL per Trade", "Profit Factor"),
+  Value  = c(n_trades, win_rate, avg_trade_pnl, profit_factor)
+)
+print(format_table(trade_df, caption = "Trade-Level Metrics", digits = 4, align = c("l","r")))
+
+```
+
+#### (3) Risk measures:
+
+-   **Daily volatility**: $\sigma = \text{std}(\text{PnL}_t)$
+
+-   **Maximum drawdown (MDD)**: worst observed drop from peak to trough in cumulative PnL
+
+-   **Calmar ratio**: $\text{Calmar} = \frac{\text{Annualized Return}}{|\text{MDD}|}$
+
+```{r risk-metrics, echo=FALSE, warning=FALSE, message=FALSE, results='asis'}
+# 3) Risk Metrics
+mdd     <- PerformanceAnalytics::maxDrawdown(pnl_xts) #drawdown
+ann_ret <- PerformanceAnalytics::Return.annualized(pnl_xts)
+calmar  <- ann_ret / abs(mdd)
+
+risk_df <- data.frame(
+  Metric = c("Daily Volatility", "Max Drawdown", "Calmar Ratio"),
+  Value  = c(sd_daily, as.numeric(mdd), as.numeric(calmar))
+)
+print(format_table(risk_df, caption = "Risk Metrics", digits = 4, align = c("l","r")))
+```
+
+**Conclusion of Strategy Performance**
+
+The copula-based strategy delivered a cumulative return of `r round(last_pnl, 4)` and a Sharpe ratio of `r round(sharpe, 2)`, with limited drawdowns (`r round(as.numeric(mdd), 4)`) and a profit factor of `r round(profit_factor, 2)`. With `r n_trades` selective trades and a win rate of `r round(win_rate * 100, 1)`%, the results support its effectiveness in identifying relative-value opportunities during tail co-movements. The low trading frequency and stable risk profile make it suitable as a tactical overlay within broader portfolios.
+
+### **11.3 Alternative Implementation Perspective**
+
+While the approach presented here interprets conditional tail probabilities as binary trading signals—resulting in relative long/short positioning—these measures can also serve a broader risk management toolkit.
+
+-   **Protective overlays** – When $\hat{p}_{1|2}$ or $\hat{p}_{2|1}$ breaches an alert threshold (e.g. \> 0.90), the manager can deploy dynamic put spreads, collars, or bespoke structured notes to cap downside, without abandoning strategic exposures.
+
+-   **Gradual de‑risking** – Instead of flipping into a full long/short pair, portfolio weights in the more vulnerable asset are tapered in proportion to the excess fragility score, keeping allocations close to policy benchmarks while cutting tail risk.
+
+Because these responses scale existing positions rather than opening offsetting legs, they trim turnover, and lower operational friction.
+
+As a final note, it is important to emphasize that our implementation is intentionally stylized and serves an illustrative purpose. We abstract away from transaction costs, execution latency, portfolio constraints, and other real-world frictions in order to focus clearly on the conceptual contribution of conditional tail dependence as a driver of relative-value insights.
+
+In this framing, copula‑implied probabilities act as tail‑aware early‑warning lights, slotting alongside VaR, stress tests, and liquidity tiers to build a unified risk dashboard.
+
+------------------------------------------------------------------------
+
+# References
+
+-   Akaike, H. (1974). *A new look at the statistical model identification*. IEEE Trans. Autom. Control, 19, 716–723.
+-   Bollerslev, T. (1986). *Generalized autoregressive conditional heteroskedasticity*. J. Econometrics, 31, 307–327.
+-   Embrechts, P., McNeil, A., & Straumann, D. (2001). *Correlation and dependence in risk management*. In Risk Management: Value at Risk and Beyond, pp. 176–223. Cambridge UP.
+-   Genest, C., & Rivest, L.-P. (1993). *Inference for bivariate Archimedean copulas*. JASA, 88, 1034–1043.
+-   Hofert, M., & Maechler, M. (2011). *Nested Archimedean copulas meet R: the nacopula package*. J. Stat. Softw., 39, 1–20.
+-   McNeil, A., Frey, R., & Embrechts, P. (2015). *Quantitative Risk Management* (2nd ed.). Princeton UP.
+-   Nelsen, R. B. (2006). *An Introduction to Copulas* (2nd ed.). Springer.
+-   Patton, A. J. (2006). *Modeling asymmetric exchange rate dependence*. Int. Econ. Rev., 47, 527–556.
+-   Ruppert, D., & Matteson, D. S. (2015). *Statistics and Data Analysis for Financial Engineering* (2nd ed.). Springer.
+-   Sklar, A. (1959). *Fonctions de répartition à n dimensions et leurs marges*. Publ. Inst. Stat. Univ. Paris, 8, 229–231.
+-   Tsukahara, H. (2005). *Semiparametric estimation in copula models*. Can. J. Stat., 33, 357–375.
