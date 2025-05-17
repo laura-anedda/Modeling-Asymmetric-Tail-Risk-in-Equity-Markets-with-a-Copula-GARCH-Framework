@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository contains the implementation and results of the project **“Copula–GARCH Modeling of Stock Returns: Tail Risk & Relative-Value Opportunities.”** The study develops a two-stage framework to model marginal volatility via GARCH(1,1) and joint dependence via copulas, focusing on asymmetric tail risk and its applications to relative-value trading signals and dynamic hedging.
+This repository contains the implementation and results of the project **“Modeling-Asymmetric-Tail-Risk-in-Equity-Markets-with-a-Copula-GARCH-Framework”** The study develops a two-stage framework to model marginal volatility via GARCH(1,1) and joint dependence via copulas, focusing on asymmetric tail risk and its applications to relative-value trading signals and dynamic hedging.
 
 ## Summary of Contents
 
